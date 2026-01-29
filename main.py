@@ -46,3 +46,8 @@ async def merge(data: dict, background_tasks: BackgroundTasks):
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
     return tasks.get(task_id, {"status": "not_found"})
+    
+@app.get("/api/validate")
+async def validate_connection():
+    # Эта функция просто говорит Make, что сервер живой
+    return {"status": "ok", "user": "Admin-Owner"}
