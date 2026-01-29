@@ -1,3 +1,6 @@
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 import os
 import uuid
 import requests
@@ -73,3 +76,4 @@ async def download_file(file_name: str):
     path = os.path.join(RESULT_DIR, file_name)
     if os.path.exists(path): return FileResponse(path)
     raise HTTPException(status_code=404, detail="File not found")
+
