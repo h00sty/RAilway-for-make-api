@@ -1,79 +1,86 @@
-import PIL.Image
-if not hasattr(PIL.Image, 'ANTIALIAS'):
-    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 import os
 import uuid
 import requests
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
+import subprocess
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
-from moviepy.editor import VideoFileClip, concatenate_videoclips
 
 app = FastAPI()
 
-# Папки для файлов
 UPLOAD_DIR = "temp_videos"
 RESULT_DIR = "results"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-# База данных задач
 tasks = {}
 
-# 1. Проверка соединения (для Make Connection)
 @app.get("/api/validate")
 async def validate_connection():
     return {"status": "ok", "user": "Admin-Owner"}
 
-# 2. Процесс склейки (в фоновом режиме)
-def merge_process(task_id: str, urls: list, aspect_ratio: str):
+def merge_process_ffmpeg(task_id: str, urls: list, aspect_ratio: str):
     try:
-        clips = []
+        downloaded_files = []
+        normalized_files = []
+
+        # 1. Скачивание
         for i, url in enumerate(urls):
-            path = os.path.join(UPLOAD_DIR, f"{task_id}_{i}.mp4")
+            raw_path = os.path.join(UPLOAD_DIR, f"{task_id}_{i}_raw.mp4")
             resp = requests.get(url, stream=True)
-            with open(path, "wb") as f:
+            with open(raw_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
-            
-            clip = VideoFileClip(path)
-            if aspect_ratio == "9:16":
-                clip = clip.resize(height=1920)
-                if clip.w > 1080: clip = clip.crop(x_center=clip.w/2, width=1080)
-            elif aspect_ratio == "16:9":
-                clip = clip.resize(width=1920)
-                if clip.h > 1080: clip = clip.crop(y_center=clip.h/2, height=1080)
-            clips.append(clip)
+            downloaded_files.append(raw_path)
 
-        final_clip = concatenate_videoclips(clips, method="compose")
+            # 2. Нормализация (приводим каждое видео к одному стандарту, чтобы они склеились)
+            # Это делается по очереди, чтобы не забить память
+            norm_path = os.path.join(UPLOAD_DIR, f"{task_id}_{i}_norm.ts")
+            
+            # Настройка размера под формат
+            scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" if aspect_ratio == "9:16" else "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
+            
+            cmd_norm = [
+                'ffmpeg', '-y', '-i', raw_path,
+                '-vf', f"{scale},fps=30",
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                '-c:a', 'aac', '-ar', '44100',
+                '-f', 'mpegts', norm_path
+            ]
+            subprocess.run(cmd_norm, check=True)
+            normalized_files.append(norm_path)
+
+        # 3. Склейка (Concat)
         result_path = os.path.join(RESULT_DIR, f"{task_id}.mp4")
-        final_clip.write_videofile(result_path, codec="libx264", audio_codec="aac")
+        concat_str = "|".join(normalized_files)
         
-        for clip in clips: clip.close()
+        cmd_merge = [
+            'ffmpeg', '-y', '-i', f"concat:{concat_str}",
+            '-c', 'copy', '-bsf:a', 'aac_adtstoasc', result_path
+        ]
+        subprocess.run(cmd_merge, check=True)
+
+        # 4. Чистка
+        for f in downloaded_files + normalized_files:
+            if os.path.exists(f): os.remove(f)
+
         tasks[task_id] = {"status": "completed", "download_url": f"/download/{task_id}.mp4"}
     except Exception as e:
         tasks[task_id] = {"status": "failed", "message": str(e)}
 
-# 3. Эндпоинт запуска склейки
 @app.post("/api/merge")
 async def start_merge(data: dict, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
     urls = data.get("video_urls", [])
     ratio = data.get("aspect_ratio", "9:16")
-    if not urls: raise HTTPException(status_code=400, detail="No URLs")
-    
     tasks[task_id] = {"status": "processing"}
-    background_tasks.add_task(merge_process, task_id, urls, ratio)
+    background_tasks.add_task(merge_process_ffmpeg, task_id, urls, ratio)
     return {"task_id": task_id}
 
-# 4. Эндпоинт проверки статуса
 @app.get("/api/status/{task_id}")
 async def get_status(task_id: str):
     return tasks.get(task_id, {"status": "not_found"})
 
-# 5. Эндпоинт скачивания
 @app.get("/download/{file_name}")
 async def download_file(file_name: str):
     path = os.path.join(RESULT_DIR, file_name)
-    if os.path.exists(path): return FileResponse(path)
-    raise HTTPException(status_code=404, detail="File not found")
-
+    return FileResponse(path) if os.path.exists(path) else HTTPException(status_code=404)
